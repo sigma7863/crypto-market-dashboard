@@ -68,7 +68,7 @@ describe("market data service", () => {
 
     await service.getSnapshot();
     await service.getSnapshot();
-    await service.getSnapshot(true);
+    await service.getSnapshot("usd", true);
 
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
@@ -80,21 +80,63 @@ describe("market data service", () => {
     await expect(service.getSnapshot()).rejects.toThrow("リクエスト上限に達しました。");
   });
 
-  it("returns timestamped price series for a selected asset chart", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      prices: [[1_700_000_000_000, 100], [1_700_000_300_000, 105]],
-      market_caps: [[1_700_000_000_000, 2_000], [1_700_000_300_000, 2_100]],
-      total_volumes: [[1_700_000_000_000, 500], [1_700_000_300_000, 510]],
-    }), { status: 200 })) as unknown as typeof fetch;
+  it("returns timestamped price, volume, and OHLC series for a selected asset chart", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL) => new Response(JSON.stringify(
+      String(url).includes("/ohlc")
+        ? [[1_700_000_000_000, 99, 103, 98, 100], [1_700_000_300_000, 100, 106, 99, 105]]
+        : {
+          prices: [[1_700_000_000_000, 100], [1_700_000_300_000, 105]],
+          market_caps: [[1_700_000_000_000, 2_000], [1_700_000_300_000, 2_100]],
+          total_volumes: [[1_700_000_000_000, 500], [1_700_000_300_000, 510]],
+        },
+    ), { status: 200 })) as unknown as typeof fetch;
     const service = createMarketDataService({ fetchImpl, now: () => 1_700_000_400_000 });
 
     const chart = await service.getChart("bitcoin", "7");
 
-    expect(chart).toMatchObject({ coinId: "bitcoin", days: "7", fetchedAt: 1_700_000_400_000 });
+    expect(chart).toMatchObject({ coinId: "bitcoin", days: "7", currency: "usd", fetchedAt: 1_700_000_400_000 });
     expect(chart.points).toEqual([
       { timestamp: 1_700_000_000_000, priceUsd: 100, marketCapUsd: 2_000, volumeUsd: 500 },
       { timestamp: 1_700_000_300_000, priceUsd: 105, marketCapUsd: 2_100, volumeUsd: 510 },
     ]);
+    expect(chart.candles).toEqual([
+      { timestamp: 1_700_000_000_000, open: 99, high: 103, low: 98, close: 100 },
+      { timestamp: 1_700_000_300_000, open: 100, high: 106, low: 99, close: 105 },
+    ]);
     expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining("/coins/bitcoin/market_chart?vs_currency=usd&days=7"), expect.any(Object));
+    expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining("/coins/bitcoin/ohlc?vs_currency=usd&days=7"), expect.any(Object));
+  });
+
+  it("requests a JPY market snapshot when selected", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL) => new Response(JSON.stringify(
+      String(url).endsWith("/global")
+        ? { data: { total_market_cap: { jpy: 400_000 }, total_volume: { jpy: 20_000 }, market_cap_percentage: {} } }
+        : [],
+    ), { status: 200 })) as unknown as typeof fetch;
+    const service = createMarketDataService({ fetchImpl });
+
+    const snapshot = await service.getSnapshot("jpy");
+
+    expect(snapshot.currency).toBe("jpy");
+    expect(snapshot.summary.totalMarketCapUsd).toBe(400_000);
+    expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining("vs_currency=jpy"), expect.any(Object));
+  });
+
+  it("keeps price and volume data available when the OHLC endpoint is rate limited", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/ohlc")) return new Response("Too many requests", { status: 429 });
+      return new Response(JSON.stringify({
+        prices: [[1_700_000_000_000, 100]],
+        market_caps: [[1_700_000_000_000, 2_000]],
+        total_volumes: [[1_700_000_000_000, 500]],
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const service = createMarketDataService({ fetchImpl });
+
+    const chart = await service.getChart("bitcoin", "7", "jpy");
+
+    expect(chart.points).toHaveLength(1);
+    expect(chart.candles).toEqual([]);
+    expect(chart.candleUnavailable).toBe(true);
   });
 });

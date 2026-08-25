@@ -1,3 +1,5 @@
+export type QuoteCurrency = "usd" | "jpy";
+
 export type MarketSummary = {
   totalMarketCapUsd: number;
   marketCapChange24hPct: number;
@@ -33,14 +35,26 @@ export type MarketChartPoint = {
   volumeUsd: number;
 };
 
+export type MarketCandle = {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+
 export type MarketChart = {
   coinId: string;
   days: ChartRange;
+  currency: QuoteCurrency;
   points: MarketChartPoint[];
+  candles: MarketCandle[];
+  candleUnavailable: boolean;
   fetchedAt: number;
 };
 
 export type MarketSnapshot = {
+  currency: QuoteCurrency;
   summary: MarketSummary;
   assets: MarketAsset[];
   sourceUpdatedAt: number;
@@ -81,6 +95,7 @@ type CoinMarketChartResponse = {
   total_volumes?: Array<[number, number]>;
 };
 
+type CoinOhlcResponse = Array<[number, number, number, number, number]>;
 type FetchLike = typeof fetch;
 
 type MarketDataServiceOptions = {
@@ -91,15 +106,9 @@ type MarketDataServiceOptions = {
   now?: () => number;
 };
 
-type CacheEntry = {
-  expiresAt: number;
-  snapshot: MarketSnapshot;
-};
-
-type ChartCacheEntry = {
-  expiresAt: number;
-  chart: MarketChart;
-};
+type SnapshotCacheEntry = { expiresAt: number; snapshot: MarketSnapshot };
+type ChartCacheEntry = { expiresAt: number; chart: MarketChart };
+type CandleCacheEntry = { expiresAt: number; candles: MarketCandle[] };
 
 const DEFAULT_BASE_URL = "https://api.coingecko.com/api/v3";
 const DEFAULT_CACHE_TTL_MS = 45_000;
@@ -115,27 +124,19 @@ function asNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-async function requestJson<T>(
-  fetchImpl: FetchLike,
-  url: string,
-  apiKey?: string,
-): Promise<T> {
+async function requestJson<T>(fetchImpl: FetchLike, url: string, apiKey?: string): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (apiKey) headers["x-cg-demo-api-key"] = apiKey;
 
   let response: Response;
   try {
-    response = await fetchImpl(url, {
-      headers,
-      signal: AbortSignal.timeout(10_000),
-    });
+    response = await fetchImpl(url, { headers, signal: AbortSignal.timeout(10_000) });
   } catch {
     throw new MarketDataError("CoinGeckoへの接続に失敗しました。");
   }
 
   if (!response.ok) {
-    const detail = response.status === 429 ? "リクエスト上限に達しました。" : "市場データを取得できませんでした。";
-    throw new MarketDataError(detail);
+    throw new MarketDataError(response.status === 429 ? "リクエスト上限に達しました。" : "市場データを取得できませんでした。");
   }
 
   return (await response.json()) as T;
@@ -147,15 +148,17 @@ export function createMarketDataService(options: MarketDataServiceOptions = {}) 
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
-  let cache: CacheEntry | undefined;
+  const snapshotCache = new Map<QuoteCurrency, SnapshotCacheEntry>();
   const chartCache = new Map<string, ChartCacheEntry>();
+  const candleCache = new Map<string, CandleCacheEntry>();
 
-  async function getSnapshot(force = false): Promise<MarketSnapshot> {
-    if (!force && cache && cache.expiresAt > now()) return cache.snapshot;
+  async function getSnapshot(currency: QuoteCurrency = "usd", force = false): Promise<MarketSnapshot> {
+    const cached = snapshotCache.get(currency);
+    if (!force && cached && cached.expiresAt > now()) return cached.snapshot;
 
     const marketsUrl = new URL(`${baseUrl}/coins/markets`);
     marketsUrl.search = new URLSearchParams({
-      vs_currency: "usd",
+      vs_currency: currency,
       order: "market_cap_desc",
       per_page: "10",
       page: "1",
@@ -168,15 +171,14 @@ export function createMarketDataService(options: MarketDataServiceOptions = {}) 
       requestJson<CoinMarketResponse[]>(fetchImpl, marketsUrl.toString(), apiKey),
     ]);
 
-    if (!global.data || !Array.isArray(markets)) {
-      throw new MarketDataError("市場データの形式を確認できませんでした。");
-    }
+    if (!global.data || !Array.isArray(markets)) throw new MarketDataError("市場データの形式を確認できませんでした。");
 
     const snapshot: MarketSnapshot = {
+      currency,
       summary: {
-        totalMarketCapUsd: asNumber(global.data.total_market_cap?.usd),
+        totalMarketCapUsd: asNumber(global.data.total_market_cap?.[currency]),
         marketCapChange24hPct: asNumber(global.data.market_cap_change_percentage_24h_usd),
-        totalVolumeUsd: asNumber(global.data.total_volume?.usd),
+        totalVolumeUsd: asNumber(global.data.total_volume?.[currency]),
         volumeChange24hPct: asNumber(global.data.volume_change_percentage_24h_usd),
         btcDominancePct: asNumber(global.data.market_cap_percentage?.btc),
         ethDominancePct: asNumber(global.data.market_cap_percentage?.eth),
@@ -201,42 +203,53 @@ export function createMarketDataService(options: MarketDataServiceOptions = {}) 
       fetchedAt: now(),
     };
 
-    cache = { snapshot, expiresAt: now() + cacheTtlMs };
+    snapshotCache.set(currency, { snapshot, expiresAt: now() + cacheTtlMs });
     return snapshot;
   }
 
-  async function getChart(coinId: string, days: ChartRange): Promise<MarketChart> {
-    if (!/^[a-z0-9-]+$/.test(coinId)) {
-      throw new MarketDataError("指定された資産IDは利用できません。");
-    }
+  async function getChart(coinId: string, days: ChartRange, currency: QuoteCurrency = "usd"): Promise<MarketChart> {
+    if (!/^[a-z0-9-]+$/.test(coinId)) throw new MarketDataError("指定された資産IDは利用できません。");
 
-    const cacheKey = `${coinId}:${days}`;
-    const cached = chartCache.get(cacheKey);
-    if (cached && cached.expiresAt > now()) return cached.chart;
+    const cacheKey = `${coinId}:${days}:${currency}`;
+    const cachedChart = chartCache.get(cacheKey);
+    if (cachedChart && cachedChart.expiresAt > now()) return cachedChart.chart;
 
     const chartUrl = new URL(`${baseUrl}/coins/${encodeURIComponent(coinId)}/market_chart`);
-    chartUrl.search = new URLSearchParams({ vs_currency: "usd", days }).toString();
+    chartUrl.search = new URLSearchParams({ vs_currency: currency, days }).toString();
     const raw = await requestJson<CoinMarketChartResponse>(fetchImpl, chartUrl.toString(), apiKey);
-    if (!Array.isArray(raw.prices)) {
-      throw new MarketDataError("価格チャートの形式を確認できませんでした。");
-    }
+    if (!Array.isArray(raw.prices)) throw new MarketDataError("価格チャートの形式を確認できませんでした。");
 
     const capsByTimestamp = new Map((raw.market_caps ?? []).map(([timestamp, value]) => [timestamp, value]));
     const volumesByTimestamp = new Map((raw.total_volumes ?? []).map(([timestamp, value]) => [timestamp, value]));
-    const points = raw.prices
-      .map(([timestamp, value]) => ({
-        timestamp: asNumber(timestamp),
-        priceUsd: asNumber(value),
-        marketCapUsd: asNumber(capsByTimestamp.get(timestamp)),
-        volumeUsd: asNumber(volumesByTimestamp.get(timestamp)),
-      }))
-      .filter(point => point.timestamp > 0 && point.priceUsd > 0);
+    const points = raw.prices.map(([timestamp, value]) => ({
+      timestamp: asNumber(timestamp),
+      priceUsd: asNumber(value),
+      marketCapUsd: asNumber(capsByTimestamp.get(timestamp)),
+      volumeUsd: asNumber(volumesByTimestamp.get(timestamp)),
+    })).filter(point => point.timestamp > 0 && point.priceUsd > 0);
+    if (points.length === 0) throw new MarketDataError("表示できる価格チャートがありません。");
 
-    if (points.length === 0) {
-      throw new MarketDataError("表示できる価格チャートがありません。");
+    const cachedCandles = candleCache.get(cacheKey);
+    let candles: MarketCandle[];
+    let candleUnavailable = false;
+    if (cachedCandles && cachedCandles.expiresAt > now()) {
+      candles = cachedCandles.candles;
+    } else {
+      const ohlcUrl = new URL(`${baseUrl}/coins/${encodeURIComponent(coinId)}/ohlc`);
+      ohlcUrl.search = new URLSearchParams({ vs_currency: currency, days }).toString();
+      try {
+        const ohlc = await requestJson<CoinOhlcResponse>(fetchImpl, ohlcUrl.toString(), apiKey);
+        candles = ohlc.map(([timestamp, open, high, low, close]) => ({
+          timestamp: asNumber(timestamp), open: asNumber(open), high: asNumber(high), low: asNumber(low), close: asNumber(close),
+        })).filter(candle => candle.timestamp > 0 && candle.high >= candle.low && candle.open > 0 && candle.close > 0);
+        candleCache.set(cacheKey, { candles, expiresAt: now() + 15 * 60_000 });
+      } catch {
+        candles = [];
+        candleUnavailable = true;
+      }
     }
 
-    const chart: MarketChart = { coinId, days, points, fetchedAt: now() };
+    const chart: MarketChart = { coinId, days, currency, points, candles, candleUnavailable, fetchedAt: now() };
     chartCache.set(cacheKey, { chart, expiresAt: now() + 30_000 });
     return chart;
   }

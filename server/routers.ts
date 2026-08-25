@@ -4,11 +4,11 @@ import { z } from "zod";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
-import { ChartRange, MarketDataError, marketDataService } from "./marketData";
+import { ChartRange, MarketDataError, marketDataService, QuoteCurrency } from "./marketData";
 
-async function loadMarketSnapshot(force = false) {
+async function loadMarketSnapshot(currency: QuoteCurrency = "usd", force = false) {
   try {
-    return await marketDataService.getSnapshot(force);
+    return await marketDataService.getSnapshot(currency, force);
   } catch (error) {
     const message = error instanceof MarketDataError
       ? error.message
@@ -17,9 +17,9 @@ async function loadMarketSnapshot(force = false) {
   }
 }
 
-async function loadMarketChart(coinId: string, days: ChartRange) {
+async function loadMarketChart(coinId: string, days: ChartRange, currency: QuoteCurrency) {
   try {
-    return await marketDataService.getChart(coinId, days);
+    return await marketDataService.getChart(coinId, days, currency);
   } catch (error) {
     const message = error instanceof MarketDataError
       ? error.message
@@ -39,11 +39,11 @@ export const appRouter = router({
     }),
   }),
   market: router({
-    overview: publicProcedure.query(() => loadMarketSnapshot()),
-    refresh: publicProcedure.mutation(() => loadMarketSnapshot(true)),
+    overview: publicProcedure.input(z.object({ currency: z.enum(["usd", "jpy"]) })).query(({ input }) => loadMarketSnapshot(input.currency)),
+    refresh: publicProcedure.input(z.object({ currency: z.enum(["usd", "jpy"]) })).mutation(({ input }) => loadMarketSnapshot(input.currency, true)),
     chart: publicProcedure
-      .input(z.object({ id: z.string().regex(/^[a-z0-9-]+$/), days: z.enum(["1", "7", "30", "365"]) }))
-      .query(({ input }) => loadMarketChart(input.id, input.days)),
+      .input(z.object({ id: z.string().regex(/^[a-z0-9-]+$/), days: z.enum(["1", "7", "30", "365"]), currency: z.enum(["usd", "jpy"]) }))
+      .query(({ input }) => loadMarketChart(input.id, input.days, input.currency)),
   }),
 });
 
