@@ -1,9 +1,10 @@
 import { COOKIE_NAME } from "@shared/const";
 import { TRPCError } from "@trpc/server";
+import { z } from "zod";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
-import { MarketDataError, marketDataService } from "./marketData";
+import { ChartRange, MarketDataError, marketDataService } from "./marketData";
 
 async function loadMarketSnapshot(force = false) {
   try {
@@ -12,6 +13,17 @@ async function loadMarketSnapshot(force = false) {
     const message = error instanceof MarketDataError
       ? error.message
       : "市場データを取得できませんでした。しばらくしてから再試行してください。";
+    throw new TRPCError({ code: "BAD_GATEWAY", message });
+  }
+}
+
+async function loadMarketChart(coinId: string, days: ChartRange) {
+  try {
+    return await marketDataService.getChart(coinId, days);
+  } catch (error) {
+    const message = error instanceof MarketDataError
+      ? error.message
+      : "価格チャートを取得できませんでした。しばらくしてから再試行してください。";
     throw new TRPCError({ code: "BAD_GATEWAY", message });
   }
 }
@@ -29,6 +41,9 @@ export const appRouter = router({
   market: router({
     overview: publicProcedure.query(() => loadMarketSnapshot()),
     refresh: publicProcedure.mutation(() => loadMarketSnapshot(true)),
+    chart: publicProcedure
+      .input(z.object({ id: z.string().regex(/^[a-z0-9-]+$/), days: z.enum(["1", "7", "30", "365"]) }))
+      .query(({ input }) => loadMarketChart(input.id, input.days)),
   }),
 });
 

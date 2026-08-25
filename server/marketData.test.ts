@@ -79,4 +79,22 @@ describe("market data service", () => {
 
     await expect(service.getSnapshot()).rejects.toThrow("リクエスト上限に達しました。");
   });
+
+  it("returns timestamped price series for a selected asset chart", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      prices: [[1_700_000_000_000, 100], [1_700_000_300_000, 105]],
+      market_caps: [[1_700_000_000_000, 2_000], [1_700_000_300_000, 2_100]],
+      total_volumes: [[1_700_000_000_000, 500], [1_700_000_300_000, 510]],
+    }), { status: 200 })) as unknown as typeof fetch;
+    const service = createMarketDataService({ fetchImpl, now: () => 1_700_000_400_000 });
+
+    const chart = await service.getChart("bitcoin", "7");
+
+    expect(chart).toMatchObject({ coinId: "bitcoin", days: "7", fetchedAt: 1_700_000_400_000 });
+    expect(chart.points).toEqual([
+      { timestamp: 1_700_000_000_000, priceUsd: 100, marketCapUsd: 2_000, volumeUsd: 500 },
+      { timestamp: 1_700_000_300_000, priceUsd: 105, marketCapUsd: 2_100, volumeUsd: 510 },
+    ]);
+    expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining("/coins/bitcoin/market_chart?vs_currency=usd&days=7"), expect.any(Object));
+  });
 });

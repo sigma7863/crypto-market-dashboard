@@ -17,8 +17,27 @@ export type MarketAsset = {
   image: string;
   priceUsd: number;
   marketCapUsd: number;
+  volume24hUsd: number;
+  high24hUsd: number;
+  low24hUsd: number;
   change24hPct: number;
   change7dPct: number;
+};
+
+export type ChartRange = "1" | "7" | "30" | "365";
+
+export type MarketChartPoint = {
+  timestamp: number;
+  priceUsd: number;
+  marketCapUsd: number;
+  volumeUsd: number;
+};
+
+export type MarketChart = {
+  coinId: string;
+  days: ChartRange;
+  points: MarketChartPoint[];
+  fetchedAt: number;
 };
 
 export type MarketSnapshot = {
@@ -49,8 +68,17 @@ type CoinMarketResponse = {
   market_cap_rank?: number;
   current_price?: number;
   market_cap?: number;
+  total_volume?: number;
+  high_24h?: number;
+  low_24h?: number;
   price_change_percentage_24h?: number;
   price_change_percentage_7d_in_currency?: number;
+};
+
+type CoinMarketChartResponse = {
+  prices?: Array<[number, number]>;
+  market_caps?: Array<[number, number]>;
+  total_volumes?: Array<[number, number]>;
 };
 
 type FetchLike = typeof fetch;
@@ -66,6 +94,11 @@ type MarketDataServiceOptions = {
 type CacheEntry = {
   expiresAt: number;
   snapshot: MarketSnapshot;
+};
+
+type ChartCacheEntry = {
+  expiresAt: number;
+  chart: MarketChart;
 };
 
 const DEFAULT_BASE_URL = "https://api.coingecko.com/api/v3";
@@ -115,6 +148,7 @@ export function createMarketDataService(options: MarketDataServiceOptions = {}) 
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
   let cache: CacheEntry | undefined;
+  const chartCache = new Map<string, ChartCacheEntry>();
 
   async function getSnapshot(force = false): Promise<MarketSnapshot> {
     if (!force && cache && cache.expiresAt > now()) return cache.snapshot;
@@ -157,6 +191,9 @@ export function createMarketDataService(options: MarketDataServiceOptions = {}) 
         image: asset.image ?? "",
         priceUsd: asNumber(asset.current_price),
         marketCapUsd: asNumber(asset.market_cap),
+        volume24hUsd: asNumber(asset.total_volume),
+        high24hUsd: asNumber(asset.high_24h),
+        low24hUsd: asNumber(asset.low_24h),
         change24hPct: asNumber(asset.price_change_percentage_24h),
         change7dPct: asNumber(asset.price_change_percentage_7d_in_currency),
       })),
@@ -168,7 +205,43 @@ export function createMarketDataService(options: MarketDataServiceOptions = {}) 
     return snapshot;
   }
 
-  return { getSnapshot };
+  async function getChart(coinId: string, days: ChartRange): Promise<MarketChart> {
+    if (!/^[a-z0-9-]+$/.test(coinId)) {
+      throw new MarketDataError("指定された資産IDは利用できません。");
+    }
+
+    const cacheKey = `${coinId}:${days}`;
+    const cached = chartCache.get(cacheKey);
+    if (cached && cached.expiresAt > now()) return cached.chart;
+
+    const chartUrl = new URL(`${baseUrl}/coins/${encodeURIComponent(coinId)}/market_chart`);
+    chartUrl.search = new URLSearchParams({ vs_currency: "usd", days }).toString();
+    const raw = await requestJson<CoinMarketChartResponse>(fetchImpl, chartUrl.toString(), apiKey);
+    if (!Array.isArray(raw.prices)) {
+      throw new MarketDataError("価格チャートの形式を確認できませんでした。");
+    }
+
+    const capsByTimestamp = new Map((raw.market_caps ?? []).map(([timestamp, value]) => [timestamp, value]));
+    const volumesByTimestamp = new Map((raw.total_volumes ?? []).map(([timestamp, value]) => [timestamp, value]));
+    const points = raw.prices
+      .map(([timestamp, value]) => ({
+        timestamp: asNumber(timestamp),
+        priceUsd: asNumber(value),
+        marketCapUsd: asNumber(capsByTimestamp.get(timestamp)),
+        volumeUsd: asNumber(volumesByTimestamp.get(timestamp)),
+      }))
+      .filter(point => point.timestamp > 0 && point.priceUsd > 0);
+
+    if (points.length === 0) {
+      throw new MarketDataError("表示できる価格チャートがありません。");
+    }
+
+    const chart: MarketChart = { coinId, days, points, fetchedAt: now() };
+    chartCache.set(cacheKey, { chart, expiresAt: now() + 30_000 });
+    return chart;
+  }
+
+  return { getSnapshot, getChart };
 }
 
 export const marketDataService = createMarketDataService();
