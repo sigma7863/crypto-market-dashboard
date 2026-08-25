@@ -20,12 +20,16 @@ import {
   LoaderCircle,
   RefreshCw,
   Search,
+  ShieldAlert,
   ShieldCheck,
   Star,
   TrendingUp,
   WalletCards,
+  X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { inspectWalletCompatibility, isWalletExtensionConflict, type WalletCompatibility } from "@/lib/walletCompatibility";
+import { loadWatchlist, persistToggledWatchlist } from "@/lib/watchlistStorage";
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const compactMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 2 });
@@ -119,6 +123,8 @@ export default function Home() {
   const [range, setRange] = useState<ChartRange>("7");
   const [search, setSearch] = useState("");
   const [manualError, setManualError] = useState<string | null>(null);
+  const [walletCompatibility, setWalletCompatibility] = useState<WalletCompatibility | null>(null);
+  const [savedWatchlistIds, setSavedWatchlistIds] = useState<string[]>([]);
   const overviewQuery = trpc.market.overview.useQuery(undefined, { refetchInterval: 60_000, staleTime: 50_000, retry: 1, refetchOnWindowFocus: true });
   const refreshMutation = trpc.market.refresh.useMutation({ onSuccess: snapshot => { utils.market.overview.setData(undefined, snapshot); setManualError(null); }, onError: error => setManualError(error.message) });
   const chartQuery = trpc.market.chart.useQuery({ id: selectedCoinId, days: range }, { staleTime: 25_000, retry: 1, refetchOnWindowFocus: false });
@@ -126,8 +132,36 @@ export default function Home() {
   const data = overviewQuery.data;
   const activeAsset = data?.assets.find(asset => asset.id === selectedCoinId) ?? data?.assets[0];
   const filteredAssets = data?.assets.filter(asset => `${asset.name} ${asset.symbol}`.toLowerCase().includes(search.trim().toLowerCase())) ?? [];
+  const savedAssets = data?.assets.filter(asset => savedWatchlistIds.includes(asset.id)) ?? [];
+  const watchlistAssets = savedWatchlistIds.length > 0 ? savedAssets : filteredAssets;
   const isRefreshing = overviewQuery.isFetching || refreshMutation.isPending;
   const errorMessage = manualError ?? overviewQuery.error?.message;
+
+  useEffect(() => {
+    const compatibility = inspectWalletCompatibility(window);
+    if (compatibility.status === "conflict") setWalletCompatibility(compatibility);
+
+    const handleExtensionError = (event: ErrorEvent) => {
+      if (isWalletExtensionConflict(event)) {
+        setWalletCompatibility({ status: "conflict", providerCount: 0, reason: "extension-error" });
+      }
+    };
+
+    window.addEventListener("error", handleExtensionError, true);
+    return () => window.removeEventListener("error", handleExtensionError, true);
+  }, []);
+
+  useEffect(() => {
+    setSavedWatchlistIds(loadWatchlist(window.localStorage));
+  }, []);
+
+  const toggleSavedAsset = (coinId: string) => {
+    setSavedWatchlistIds(current => persistToggledWatchlist(current, coinId, window.localStorage));
+  };
+
+  const walletHelp = walletCompatibility?.reason === "multiple-providers"
+    ? `${walletCompatibility.providerCount}個のウォレットプロバイダーが検出されました。`
+    : "ウォレット拡張機能がwindow.ethereumの競合を起こしている可能性があります。";
 
   return (
     <main className="market-shell min-h-screen text-slate-100">
@@ -140,6 +174,7 @@ export default function Home() {
 
         {overviewQuery.isLoading && !data ? <LoadingState /> : null}
         {errorMessage && !data ? <section className="error-panel" role="alert"><ShieldCheck className="h-5 w-5 text-rose-300" /><div><h2 className="font-semibold text-white">市場データを取得できませんでした</h2><p className="mt-1 text-sm text-slate-400">{errorMessage}</p></div><button type="button" className="refresh-button ml-auto" onClick={() => refreshMutation.mutate()}>再試行</button></section> : null}
+        {walletCompatibility?.status === "conflict" ? <section className="wallet-compatibility" role="status"><ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-200" /><div className="min-w-0 flex-1"><p className="font-semibold text-amber-100">ウォレット拡張機能の互換性を確認してください</p><p className="mt-1 text-sm leading-relaxed text-slate-300">{walletHelp} このダッシュボードはウォレットへ接続しません。拡張機能を一つだけ有効にするか、シークレットウィンドウ／別プロファイルで開いてください。</p></div><button type="button" className="compatibility-dismiss" onClick={() => setWalletCompatibility(null)} aria-label="互換性案内を閉じる"><X className="h-4 w-4" /></button></section> : null}
 
         {data && activeAsset ? <>
           <section className="macro-strip mb-5" aria-label="市場マクロ指標"><div><p>GLOBAL MARKET CAP</p><strong>{compactMoney.format(data.summary.totalMarketCapUsd)}</strong></div><div><p>24H MARKET MOVE</p><Change value={data.summary.marketCapChange24hPct} small /></div><div><p>BTC DOMINANCE</p><strong>{data.summary.btcDominancePct.toFixed(2)}%</strong></div><div><p>24H VOLUME</p><strong>{compactMoney.format(data.summary.totalVolumeUsd)}</strong></div><div className="hidden xl:block"><p>COIN UNIVERSE</p><strong>{integer.format(data.summary.activeCryptocurrencies)}</strong></div><span className="ml-auto hidden items-center gap-1.5 text-[11px] text-slate-500 lg:inline-flex"><Clock3 className="h-3.5 w-3.5" />{new Date(data.fetchedAt).toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "medium" })}</span></section>
@@ -154,9 +189,9 @@ export default function Home() {
             </article>
 
             <aside className="space-y-5">
-              <section className="terminal-panel p-5"><div className="mb-5 flex items-center justify-between"><div><p className="eyebrow">Asset profile</p><h2 className="mt-1 text-lg font-semibold text-white">詳細情報</h2></div><button type="button" className="icon-button" aria-label={`${activeAsset.name}をウォッチリストに追加`}><Star className="h-4 w-4" /></button></div><div className="grid grid-cols-2 gap-2.5"><DetailStat label="時価総額" value={compactMoney.format(activeAsset.marketCapUsd)} icon={Landmark} /><DetailStat label="ランキング" value={`#${activeAsset.rank}`} icon={WalletCards} /><DetailStat label="24時間" value={formatChange(activeAsset.change24hPct)} icon={TrendingUp} /><DetailStat label="市場シェア" value={`${((activeAsset.marketCapUsd / data.summary.totalMarketCapUsd) * 100).toFixed(2)}%`} icon={Coins} /></div><div className="mt-4 rounded-xl border border-amber-300/10 bg-amber-300/[0.045] px-3.5 py-3 text-xs leading-relaxed text-slate-400">価格データは公開市場情報です。売買の推奨や投資助言を目的とした表示ではありません。</div></section>
+              <section className="terminal-panel p-5"><div className="mb-5 flex items-center justify-between"><div><p className="eyebrow">Asset profile</p><h2 className="mt-1 text-lg font-semibold text-white">詳細情報</h2></div><button type="button" onClick={() => toggleSavedAsset(activeAsset.id)} className={`icon-button ${savedWatchlistIds.includes(activeAsset.id) ? "icon-button-active" : ""}`} aria-label={savedWatchlistIds.includes(activeAsset.id) ? `${activeAsset.name}をウォッチリストから削除` : `${activeAsset.name}をウォッチリストに追加`}><Star className="h-4 w-4" fill={savedWatchlistIds.includes(activeAsset.id) ? "currentColor" : "none"} /></button></div><div className="grid grid-cols-2 gap-2.5"><DetailStat label="時価総額" value={compactMoney.format(activeAsset.marketCapUsd)} icon={Landmark} /><DetailStat label="ランキング" value={`#${activeAsset.rank}`} icon={WalletCards} /><DetailStat label="24時間" value={formatChange(activeAsset.change24hPct)} icon={TrendingUp} /><DetailStat label="市場シェア" value={`${((activeAsset.marketCapUsd / data.summary.totalMarketCapUsd) * 100).toFixed(2)}%`} icon={Coins} /></div><div className="mt-4 rounded-xl border border-amber-300/10 bg-amber-300/[0.045] px-3.5 py-3 text-xs leading-relaxed text-slate-400">価格データは公開市場情報です。売買の推奨や投資助言を目的とした表示ではありません。</div></section>
 
-              <section className="terminal-panel overflow-hidden"><div className="border-b border-white/[0.08] px-5 py-4"><div className="flex items-center justify-between"><div><p className="eyebrow">Watchlist</p><h2 className="mt-1 text-lg font-semibold text-white">主要資産</h2></div><span className="rounded-full bg-white/[0.05] px-2 py-1 text-[10px] text-slate-400">{data.assets.length} 銘柄</span></div><label className="relative mt-4 block"><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" /><input value={search} onChange={event => setSearch(event.target.value)} className="watch-search" placeholder="銘柄を検索" aria-label="銘柄を検索" /></label></div><div className="max-h-[335px] overflow-y-auto p-2">{filteredAssets.map(asset => <button type="button" key={asset.id} onClick={() => setSelectedCoinId(asset.id)} className={`watchlist-row ${asset.id === activeAsset.id ? "watchlist-row-active" : ""}`}><AssetAvatar image={asset.image} symbol={asset.symbol} className="h-8 w-8" /><span className="min-w-0 flex-1 text-left"><span className="block truncate text-sm font-medium text-slate-200">{asset.name}</span><span className="block text-[10px] font-semibold uppercase tracking-wider text-slate-500">{asset.symbol}</span></span><span className="text-right"><span className="block text-xs font-medium tabular-nums text-slate-200">{formatPrice(asset.priceUsd)}</span><Change value={asset.change24hPct} small /></span><ChevronRight className="h-4 w-4 text-slate-600" /></button>)}{filteredAssets.length === 0 ? <p className="px-3 py-7 text-center text-sm text-slate-500">一致する銘柄はありません。</p> : null}</div></section>
+              <section className="terminal-panel overflow-hidden"><div className="border-b border-white/[0.08] px-5 py-4"><div className="flex items-center justify-between"><div><p className="eyebrow">Watchlist</p><h2 className="mt-1 text-lg font-semibold text-white">{savedWatchlistIds.length ? "保存済みウォッチリスト" : "主要資産"}</h2></div><span className="rounded-full bg-white/[0.05] px-2 py-1 text-[10px] text-slate-400">{savedWatchlistIds.length ? `${savedAssets.length} 保存済み` : `${data.assets.length} 銘柄`}</span></div>{savedWatchlistIds.length === 0 ? <label className="relative mt-4 block"><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" /><input value={search} onChange={event => setSearch(event.target.value)} className="watch-search" placeholder="銘柄を検索" aria-label="銘柄を検索" /></label> : <p className="mt-3 text-xs leading-relaxed text-slate-500">星印を押すと、選択中の銘柄をこのブラウザに保存できます。</p>}</div><div className="max-h-[335px] overflow-y-auto p-2">{watchlistAssets.map(asset => <button type="button" key={asset.id} onClick={() => setSelectedCoinId(asset.id)} className={`watchlist-row ${asset.id === activeAsset.id ? "watchlist-row-active" : ""}`}><AssetAvatar image={asset.image} symbol={asset.symbol} className="h-8 w-8" /><span className="min-w-0 flex-1 text-left"><span className="block truncate text-sm font-medium text-slate-200">{asset.name}</span><span className="block text-[10px] font-semibold uppercase tracking-wider text-slate-500">{asset.symbol}</span></span><span className="text-right"><span className="block text-xs font-medium tabular-nums text-slate-200">{formatPrice(asset.priceUsd)}</span><Change value={asset.change24hPct} small /></span><ChevronRight className="h-4 w-4 text-slate-600" /></button>)}{watchlistAssets.length === 0 ? <p className="px-3 py-7 text-center text-sm text-slate-500">保存済み銘柄は現在の上位資産にありません。</p> : null}</div></section>
             </aside>
           </section>
 
